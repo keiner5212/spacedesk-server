@@ -26,11 +26,6 @@ from .input import VirtualInput
 
 log = logging.getLogger("spacedesk.server")
 
-# La app NO hace "fit to screen": muestra el framebuffer a su tamaño real
-# (1:1), así que un framebuffer más chico que la pantalla aparece como un
-# rectángulo pequeño en una esquina en vez de llenarla (confirmado
-# empíricamente). Por eso el tamaño sale de config.ini (capture.width/height).
-
 
 class PeekedReader:
     """Envuelve un StreamReader para poder 'devolver' bytes ya leídos durante
@@ -192,10 +187,12 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     ident = proto.IdentificationPacket.parse(header)
     log.info("Cliente identificado (%s): %r", addr, ident)
 
-    # El tamano del framebuffer y la calidad JPEG salen de config.ini: la
-    # SurfaceView donde la app dibuja es SIEMPRE 1920x1200 (confirmado con
-    # logcat real: "addSurfaceChangedCallback ... 0,0-1920,1200"), sin importar
-    # lo que el cliente reporte en su Identification.
+    # El tamano del framebuffer y la calidad JPEG salen de config.ini. La app
+    # NO hace "fit to screen": muestra el frame a 1:1, asi que un framebuffer
+    # mas chico que la pantalla aparece como un rectangulo en una esquina. La
+    # SurfaceView real de la app es SIEMPRE 1920x1200 (confirmado con logcat:
+    # "addSurfaceChangedCallback ... 0,0-1920,1200"), sin importar lo que el
+    # cliente reporte en su Identification.
     capture = await shared_capture.get_or_create()
 
     # Sin esto la app se queda mostrando "Display off" indefinidamente aunque

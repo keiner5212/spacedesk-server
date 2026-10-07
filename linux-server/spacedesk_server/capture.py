@@ -124,7 +124,8 @@ class PortalClient:
             try:
                 self.conn.call_sync(
                     PORTAL_BUS_NAME, PORTAL_OBJECT_PATH, iface, method,
-                    GLib.Variant(signature, args + (opts,)),
+                    # GDBus exige que los parametros sean una tupla.
+                    GLib.Variant(f"({signature})", args + (opts,)),
                     GLib.VariantType.new("(o)"), Gio.DBusCallFlags.NONE, -1, None,
                 )
             except GLib.Error as exc:
