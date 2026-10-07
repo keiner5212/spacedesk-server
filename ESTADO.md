@@ -1,5 +1,60 @@
 # SpaceDesk Linux Server — Estado del proyecto
 
+## 2026-10-06: migración de GNOME/Mutter a KDE Plasma + portales XDG
+
+**Síntoma**: al conectar la tablet, cada intento de captura fallaba con
+`GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name
+org.gnome.Mutter.RemoteDesktop was not provided by any .service files (2)`,
+repetido ~6 veces por segundo (la tablet reconecta en loop y cada intento
+volcaba un traceback completo).
+
+**Causa raíz: el escritorio cambió, el código no**. `capture.py`/`input.py`
+estaban escritos solo contra la API privada de Mutter
+(`org.gnome.Mutter.ScreenCast.RecordVirtual` + `org.gnome.Mutter.RemoteDesktop`).
+Esta máquina corre **KDE Plasma 6.7.4 en Wayland** (`kwin_wayland` es dueño de
+`wayland-0`; `XDG_CURRENT_DESKTOP=XFCE` es solo el entorno de sesión), y Mutter
+no está instalado ni corre. No hay ningún nombre `org.gnome.Mutter.*` en el bus
+de sesión, así que la API no podía funcionar bajo ninguna circunstancia. La
+sección "Arquitectura" de más abajo describe el diseño sobre Ubuntu 24.04 +
+GNOME; esta máquina es Debian sid + Plasma.
+
+**Qué se cambió**:
+- `capture.py`: reescrito sobre `org.freedesktop.portal.ScreenCast` con
+  `types=VIRTUAL` + `org.freedesktop.portal.RemoteDesktop` sobre la misma sesión.
+  En este build `AvailableSourceTypes` = **7** (MONITOR|WINDOW|VIRTUAL), así que
+  el portal de KDE puede crear un output virtual real de KWin, no una superficie
+  de screencast aislada.
+- `input.py`: mismas llamadas `Notify*`, pero con el `node_id` de PipeWire
+  (`u`) en vez del path D-Bus del stream (`s`), y escalando al tamaño **lógico
+  del stream** (el `size` de `streams[]`), que es el espacio de coordenadas que
+  espera el portal.
+- `server.py`: `SharedCapture` recuerda el fallo de captura. Antes cada
+  reconexión de la tablet reintentaba el portal y volcaba un traceback; ahora se
+  loguea **una** vez y cada cliente se rechaza con una línea corta.
+- `config.py` + `config.ini`: puerto, nivel de log, resolución, calidad JPEG,
+  modo del cursor, tipo de fuente del portal y persistencia de permisos.
+- `start.sh`: crea el venv (`.venv`, `--system-site-packages`) y arranca el
+  servidor. `main.py --config <ruta>` para otro INI.
+- **Eliminado el transporte USB** (pedido explícito): `usb_transport.py`,
+  `aoa_session.py`, `aoa_test.py`, `99-spacedesk-usb.rules` y la dependencia
+  `pyusb`. La tablet se conecta por WiFi. Por eso también se fue la calidad JPEG
+  diferenciada 95/USB vs 55/WiFi: ahora hay una sola en `config.ini`.
+
+**Pendiente de verificar en la máquina** (requiere la tablet y aceptar el
+diálogo de permisos de KDE):
+1. Que el output virtual aparece en la configuración de pantallas de KDE.
+2. Que `capture.persist_permissions` evita el diálogo en el segundo arranque
+   (`xdg-desktop-portal-kde` tiene historial de implementar esto a medias).
+3. Que `granted_devices` = 7 (teclado + puntero + touch) en el log.
+4. Touch sobre el monitor virtual (el portal traduce las coordenadas del
+   stream al output correcto, igual que hacía Mutter).
+
+**Limitación conocida**: Plasma 6.7 crea el output virtual a **1920x1080 fijo**
+(hardcodeado en `WaylandIntegration::startStreamingVirtual`); el `videoscale` del
+pipeline GStreamer lo reescala al tamaño de `config.ini`, así que la tablet
+sigue recibiendo 1920x1200. El input se escala al tamaño lógico del stream
+(1920x1080), no al del framebuffer.
+
 Objetivo: usar la tablet Android (app oficial spacedesk, sin modificar) como
 pantalla extendida de este PC Linux (Ubuntu 24.04, GNOME/Wayland), mediante un
 servidor propio que reimplementa el protocolo de red de spacedesk (que solo

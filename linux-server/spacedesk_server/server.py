@@ -18,21 +18,18 @@ import logging
 import socket
 
 from . import protocol as proto
-from . import usb_transport
 from . import ws_transport
 from .capture import VirtualMonitorCapture
+from .config import Settings
 from .discovery import start_discovery_responder
 from .input import VirtualInput
 
 log = logging.getLogger("spacedesk.server")
 
-LISTEN_PORT = proto.DISCOVERY_PORT  # 28252, mismo puerto para datos y discovery (UDP aparte)
 # La app NO hace "fit to screen": muestra el framebuffer a su tamaño real
 # (1:1), así que un framebuffer más chico que la pantalla aparece como un
 # rectángulo pequeño en una esquina en vez de llenarla (confirmado
-# empíricamente). Por eso hay que usar exactamente la resolución que la app
-# pide en su Identification (ident.effective_width/height), no un valor
-# recalculado del lado servidor -- ver handle_client.
+# empíricamente). Por eso el tamaño sale de config.ini (capture.width/height).
 
 
 class PeekedReader:
@@ -105,25 +102,50 @@ async def detect_transport(reader, writer) -> Connection:
     return Connection(PeekedReader(reader, peek), writer, False)
 
 
+class CaptureUnavailable(Exception):
+    """La captura no se pudo crear. El fallo se recuerda: sin esto cada cliente
+    que reconecta reintentaria el portal y volcaria un traceback, y la tablet
+    entra en un loop de reconexion que llena el log de basura."""
+
+
 class SharedCapture:
     """Una sola instancia de captura compartida entre clientes (es 'la' pantalla
-    extendida del PC). Se crea de forma diferida con la resolución que reporte
-    el primer cliente que conecte -- el tamaño fijo por defecto no tenía en
-    cuenta la resolución real de cada dispositivo."""
+    extendida del PC). Se crea de forma diferida, la primera vez que alguien
+    conecta."""
 
-    def __init__(self):
+    def __init__(self, settings: Settings):
+        self._settings = settings
         self._capture: VirtualMonitorCapture | None = None
         self._lock = asyncio.Lock()
+        self._failure: str | None = None
 
-    async def get_or_create(self, width: int, height: int, jpeg_quality: int) -> VirtualMonitorCapture:
+    async def get_or_create(self) -> VirtualMonitorCapture:
         async with self._lock:
+            if self._failure is not None:
+                raise CaptureUnavailable(self._failure)
             if self._capture is None:
+                settings = self._settings
+                cap = VirtualMonitorCapture(
+                    settings.width, settings.height,
+                    jpeg_quality=settings.jpeg_quality,
+                    source_type=settings.source_type,
+                    cursor_mode=settings.cursor_mode,
+                    persist_permissions=settings.persist_permissions,
+                )
                 loop = asyncio.get_event_loop()
-                cap = VirtualMonitorCapture(width, height, jpeg_quality=jpeg_quality)
-                await loop.run_in_executor(None, cap.start)
+                try:
+                    await loop.run_in_executor(None, cap.start)
+                except Exception as exc:
+                    cap.stop()
+                    self._failure = str(exc)
+                    log.error("No se pudo crear la captura: %s", exc)
+                    log.error(
+                        "Revisa que estes en una sesion Wayland con un compositor que "
+                        "soporte el portal ScreenCast (Plasma 6+, GNOME 42+) y que "
+                        "xdg-desktop-portal este corriendo."
+                    )
+                    raise CaptureUnavailable(self._failure) from exc
                 self._capture = cap
-                log.info("Monitor virtual creado a demanda: %dx%d, calidad=%d",
-                         width, height, jpeg_quality)
             return self._capture
 
 
@@ -145,14 +167,18 @@ async def handle_client(reader, writer, shared_capture: SharedCapture) -> None:
     except (asyncio.IncompleteReadError, ConnectionError):
         return
 
-    await handle_connection(conn, addr, shared_capture)
+    try:
+        await handle_connection(conn, addr, shared_capture)
+    except CaptureUnavailable as exc:
+        log.warning("Conexion de %s rechazada: %s", addr, exc)
+        conn.close()
+    except (ConnectionError, OSError):
+        conn.close()
 
 
 async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     """Maneja una sesion completa (handshake + sender/receiver) sobre una
-    Connection ya establecida -- usado tanto por TCP/WebSocket (handle_client)
-    como por USB (usb_transport.usb_acceptor_loop), que solo difieren en como
-    se construye el objeto `conn`."""
+    Connection ya establecida."""
     result = await conn.read_packet()
     if result is None:
         conn.close()
@@ -166,26 +192,19 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     ident = proto.IdentificationPacket.parse(header)
     log.info("Cliente identificado (%s): %r", addr, ident)
 
-    # La SurfaceView donde la app dibuja es SIEMPRE 1920x1200 (confirmado con
+    # El tamano del framebuffer y la calidad JPEG salen de config.ini: la
+    # SurfaceView donde la app dibuja es SIEMPRE 1920x1200 (confirmado con
     # logcat real: "addSurfaceChangedCallback ... 0,0-1920,1200"), sin importar
-    # lo que el cliente reporte en su Identification -- por WiFi la app reporta
-    # justo 1920x1200, pero por USB reporta 1920x1080 (inconsistencia propia de
-    # la app entre transportes). Usar siempre el tamano real de la superficie
-    # en vez de ident.effective_width/height().
-    #
-    # Calidad mas alta para USB: el cuello de botella de WiFi (ver memoria del
-    # proyecto, ~200-400ms de espera por frame) no aplica sobre USB2 bulk
-    # (~480Mbps), asi que no hace falta comprimir tan agresivo.
-    jpeg_quality = 95 if addr == "USB" else 55
-    capture = await shared_capture.get_or_create(1920, 1200, jpeg_quality)
+    # lo que el cliente reporte en su Identification.
+    capture = await shared_capture.get_or_create()
 
     # Sin esto la app se queda mostrando "Display off" indefinidamente aunque
     # ya le estemos mandando FrameBuffer -- ver protocol.py build_visibility_header.
     await conn.write_packet(bytes(proto.build_visibility_header(True)))
 
     vinput = VirtualInput(
-        capture.conn, capture.remote_desktop_session_path, capture.stream_path,
-        capture.width, capture.height,
+        capture.conn, capture.session_handle, capture.stream_node_id,
+        capture.stream_width, capture.stream_height,
     )
     ack_event = asyncio.Event()
     ack_event.set()  # listo para mandar el primer frame sin esperar ACK previo
@@ -268,32 +287,29 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     log.info("Conexion cerrada: %s", addr)
 
 
-async def run_server() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+async def run_server(settings: Settings) -> None:
+    logging.basicConfig(
+        level=getattr(logging, settings.log_level, logging.INFO),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    log.info("Configuracion: %s", settings.describe())
 
-    shared_capture = SharedCapture()
-    await start_discovery_responder()
+    shared_capture = SharedCapture(settings)
+    if settings.discovery_enabled:
+        await start_discovery_responder(settings.port)
 
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, shared_capture), "0.0.0.0", LISTEN_PORT
+        lambda r, w: handle_client(r, w, shared_capture), "0.0.0.0", settings.port
     )
     log.info("Servidor spacedesk-linux escuchando en puerto %d (monitor virtual se crea al conectar)",
-              LISTEN_PORT)
-
-    # Transporte USB (Android Open Accessory) en paralelo al TCP/WebSocket --
-    # ambos comparten la misma SharedCapture, asi que es "la" misma pantalla
-    # extendida sin importar por donde se conecte la tablet. Se auto-deshabilita
-    # con un solo log.warning si pyusb no esta instalado (ver usb_transport.py).
-    usb_task = asyncio.create_task(
-        usb_transport.usb_acceptor_loop(lambda conn, addr: handle_connection(conn, addr, shared_capture))
-    )
+              settings.port)
 
     async with server:
-        await asyncio.gather(server.serve_forever(), usb_task)
+        await server.serve_forever()
 
 
-def main() -> None:
+def main(settings: Settings) -> None:
     try:
-        asyncio.run(run_server())
+        asyncio.run(run_server(settings))
     except KeyboardInterrupt:
         pass

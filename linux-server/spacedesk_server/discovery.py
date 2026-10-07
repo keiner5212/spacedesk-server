@@ -9,7 +9,7 @@ solo evita tener que escribir la IP a mano.
 import asyncio
 import logging
 
-from .protocol import DISCOVERY_MAGIC, DISCOVERY_PORT
+from .protocol import DISCOVERY_MAGIC
 
 log = logging.getLogger("spacedesk.discovery")
 
@@ -25,13 +25,13 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
             self.transport.sendto(DISCOVERY_MAGIC, addr)
 
 
-async def start_discovery_responder() -> asyncio.DatagramTransport:
+async def start_discovery_responder(port: int) -> asyncio.DatagramTransport:
     loop = asyncio.get_event_loop()
     transport, _ = await loop.create_datagram_endpoint(
         DiscoveryProtocol,
-        local_addr=("0.0.0.0", DISCOVERY_PORT),
+        local_addr=("0.0.0.0", port),
         reuse_port=True,
         allow_broadcast=True,
     )
-    log.info("Discovery UDP escuchando en puerto %d", DISCOVERY_PORT)
+    log.info("Discovery UDP escuchando en puerto %d", port)
     return transport

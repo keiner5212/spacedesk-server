@@ -1,7 +1,9 @@
-# SpaceDesk Linux Server — Dependencias Python
-
-# Transporte USB (Android Open Accessory)
-pyusb==1.2.1
-
-# Nota: PyGObject (gi) debe venir del sistema, no se instala vía pip
-# Ver README.md para instrucciones de instalación de dependencias del sistema
+# SpaceDesk Linux Server - Dependencias Python
+#
+# Nota: PyGObject (gi), GStreamer y python-evdev vienen del sistema, no se
+# instalan por pip. El venv se crea con --system-site-packages (ver start.sh):
+#   sudo apt install python3-gi gir1.2-gstreamer-1.0 python3-evdev
+#
+# Todo lo que hace falta viene del sistema; este archivo queda para cuando se
+# agregue alguna dependencia pip.
+evdev>=1.6
