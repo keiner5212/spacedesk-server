@@ -18,8 +18,11 @@ PACKAGES=(
   gir1.2-gstreamer-1.0
   gir1.2-gst-plugins-base1.0
   libgstreamer1.0-0
-  libgst-plugins-base1.0-0
-  libpipewiregst-0.3-0
+  libgstreamer-plugins-base1.0-0
+  gstreamer1.0-plugins-good
+  # Provides the pipewiresrc element. Without it capture fails with
+  # `gst_parse_error: no element "pipewiresrc"`.
+  gstreamer1.0-pipewire
   python3-evdev
 )
 
@@ -54,6 +57,25 @@ check() {
   else
     echo "FAIL venv or Python dependencies missing -- run ./install.sh"
     ok=1
+  fi
+
+  if [ -x "$PYTHON" ]; then
+    local missing
+    missing=$("$PYTHON" -c "
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst
+Gst.init(None)
+print(' '.join(e for e in ('pipewiresrc', 'videoscale', 'jpegenc')
+              if Gst.ElementFactory.find(e) is None))
+" 2>/dev/null || true)
+    if [ -n "$missing" ]; then
+      echo "FAIL missing GStreamer elements: $missing"
+      echo "     sudo apt install gstreamer1.0-pipewire gstreamer1.0-plugins-good"
+      ok=1
+    else
+      echo "OK   GStreamer elements (pipewiresrc, videoscale, jpegenc)"
+    fi
   fi
 
   if [ -z "${WAYLAND_DISPLAY:-}" ]; then

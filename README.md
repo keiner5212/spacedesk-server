@@ -25,9 +25,11 @@ Full history of what was tried: [ESTADO.md](ESTADO.md).
 
 ## Requirements
 
-- Debian or Ubuntu with **KDE Plasma 6+ (or GNOME 42+) on Wayland**
-- Python 3.10+
-- Android tablet with the official spacedesk app
+Debian or Ubuntu with **KDE Plasma 6+ (or GNOME 42+) on Wayland**, Python 3.10+,
+and an Android tablet with the official spacedesk app.
+
+Full list, package names per distribution, and how to verify them:
+**[SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md)**.
 
 ## Install
 
@@ -96,6 +98,10 @@ linux-server/
     ├── ws_transport.py     # WebSocket framing
     └── discovery.py        # answers the UDP broadcast
 ```
+
+More detail: [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md) for the system
+packages and how to verify them, [ESTADO.md](ESTADO.md) for what was tried and
+what still needs checking with a real tablet.
 
 ## Troubleshooting
 
