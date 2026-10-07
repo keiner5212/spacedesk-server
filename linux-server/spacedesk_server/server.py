@@ -25,6 +25,7 @@ from .capture import VirtualMonitorCapture
 from .config import Settings
 from .discovery import start_discovery_responder
 from .input import VirtualInput
+from .port import free_port
 
 log = logging.getLogger("spacedesk.server")
 
@@ -246,11 +247,15 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     inflight_at: collections.deque = collections.deque()
     frames_sent = 0
     bytes_sent = 0
+    frames_skipped = 0
     samples_at_window = capture.samples
     window_start = time.monotonic()
+    keepalive = shared_capture.settings.keepalive_ms / 1000
+    last_sent: bytes | None = None
 
     async def sender() -> None:
-        nonlocal unacked, frames_sent, bytes_sent, window_start, samples_at_window
+        nonlocal unacked, frames_sent, bytes_sent, frames_skipped
+        nonlocal window_start, samples_at_window, last_sent
         loop = asyncio.get_event_loop()
         while not stop_event.is_set():
             if unacked >= max_inflight:
@@ -259,13 +264,16 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 except asyncio.TimeoutError:
                     continue
             ack_event.clear()
-            # timeout corto para el keep-alive: si la pantalla esta estatica
-            # repetimos el ultimo frame para que la app no interprete la
-            # espera como ancho de banda bajo.
-            jpeg = await loop.run_in_executor(None, capture.get_frame, 0.03)
+            # Espera event-driven: con la pantalla estatica duerme hasta que
+            # el compositor produzca algo o venza el keep-alive. Antes se
+            # sondeaba en boucle con un timeout de 30 ms, lo que retrasaba el
+            # primer frame con contenido y quemaba viajes al thread pool.
+            jpeg, novel = await loop.run_in_executor(None, capture.wait_frame, last_sent, keepalive)
             if jpeg is None:
                 ack_event.set()
                 continue
+            if not novel:
+                frames_skipped += 1
             fb_header = proto.build_framebuffer_header(
                 payload_len=len(jpeg),
                 width=capture.width,
@@ -285,6 +293,7 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 inflight_at.append(time.monotonic())
                 unacked += 1
                 await conn.write_packet(fb_header, jpeg)
+                last_sent = jpeg
                 frames_sent += 1
                 bytes_sent += len(jpeg)
             except (ConnectionError, OSError):
@@ -296,18 +305,26 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 fps = frames_sent / elapsed
                 latency = capture.latency
                 log.info(
-                    "Stats: enviados %.1f fps (%.0f KB/frame), capturado %.1f fps, "
-                    "latencia ACK %s, jpeg=%d, %dx%d",
+                    "Stats: enviados %.1f fps (%.0f KB/frame, %d sin novelty), "
+                    "capturado %.1f fps, latencia ACK %s, jpeg=%d, %dx%d",
                     fps,
                     bytes_sent / frames_sent / 1024 if frames_sent else 0,
+                    frames_skipped,
                     (capture.samples - samples_at_window) / elapsed,
                     f"{latency * 1000:.0f} ms" if latency else "n/d",
                     capture.jpeg_quality, capture.width, capture.height,
                 )
-                if shared_capture.settings.adaptive_quality and frames_sent:
+                # Solo tiene sentido ajustar si hay contenido fluyendo. Con la
+                # pantalla estatica el fps mide lo que la app tarda en activar
+                # un frame repetido, no el ancho de banda: ajustar ahi baja la
+                # calidad sin motivo y la imagen queda degradada cuando vuelve
+                # el contenido.
+                if (shared_capture.settings.adaptive_quality and frames_sent
+                        and frames_skipped < frames_sent):
                     _adjust_quality(capture, fps, shared_capture.settings.target_fps)
                 frames_sent = 0
                 bytes_sent = 0
+                frames_skipped = 0
                 samples_at_window = capture.samples
                 window_start = now
 
@@ -390,12 +407,15 @@ async def run_server(settings: Settings) -> None:
     )
     log.info("Configuracion: %s", settings.describe())
 
+    free_port(settings.port)
+
     shared_capture = SharedCapture(settings)
     if settings.discovery_enabled:
         await start_discovery_responder(settings.port, settings.name)
 
     server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, shared_capture), "0.0.0.0", settings.port
+        lambda r, w: handle_client(r, w, shared_capture), "0.0.0.0", settings.port,
+        reuse_port=False,
     )
     log.info("Servidor spacedesk-linux escuchando en puerto %d (monitor virtual se crea al conectar)",
               settings.port)

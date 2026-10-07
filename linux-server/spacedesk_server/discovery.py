@@ -13,9 +13,8 @@ servidor, hacia que la app nunca viera el servidor. Ver
 
 import asyncio
 import logging
-import struct
 
-from .protocol import DISCOVERY_MAGIC, build_discovery_response
+from .protocol import build_discovery_response, ipv4_to_int, set_u32
 
 log = logging.getLogger("spacedesk.discovery")
 
@@ -25,6 +24,10 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
         self.server_name = server_name
         self.port = port
         self.transport = None
+        # La respuesta es siempre la misma (nombre, puerto y flags no cambian),
+        # solo patcheamos la IP de origen, que ademas la app sobreescribe al
+        # parsear. Asi no re-armamos 308 bytes por cada request.
+        self._response = bytearray(build_discovery_response(server_name, port, "0.0.0.0"))
 
     def connection_made(self, transport):
         self.transport = transport
@@ -32,16 +35,19 @@ class DiscoveryProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr):
         if not data.startswith(b"SPACEDESK-NET-CLIENT"):
             return
+        # Se responde a CADA request, sin dedup. La app manda el mismo request 5
+        # veces por rafaga a proposito: su socket solo vive ~300 ms por ronda
+        # y el wiFi pierde paquetes, asi que con una sola respuesta por rafaga
+        # hay rondas enteras sin respuesta. Contestar a todas maximize la
+        # chance de que al menos una llegue antes de que cierre el socket.
         try:
-            response = build_discovery_response(self.server_name, self.port, addr[0])
-        except (ValueError, struct.error) as exc:
-            # Nunca dejar que una peticion mal formada tumbe el endpoint: el
-            # discovery es best effort, perderlo rompe el descubrimiento.
-            log.warning("Discovery: no se pudo responder a %s: %s", addr, exc)
+            set_u32(self._response, 256, ipv4_to_int(addr[0]))
+        except ValueError as exc:
+            log.warning("Discovery: origen invalido %s: %s", addr[0], exc)
             return
-        self.transport.sendto(response, addr)
-        log.info("Discovery: respondiendo a %s con '%s' en %s:%d",
-                 addr, self.server_name, addr[0], self.port)
+        self.transport.sendto(bytes(self._response), addr)
+        log.debug("Discovery: respondiendo a %s con '%s' en %s:%d",
+                  addr, self.server_name, addr[0], self.port)
 
 
 async def start_discovery_responder(port: int, server_name: str) -> asyncio.DatagramTransport:
@@ -49,7 +55,10 @@ async def start_discovery_responder(port: int, server_name: str) -> asyncio.Data
     transport, _ = await loop.create_datagram_endpoint(
         lambda: DiscoveryProtocol(server_name, port),
         local_addr=("0.0.0.0", port),
-        reuse_port=True,
+        # Sin reuse_port: si quedo otra instancia viva, el kernel reparte el
+        # trafico entre las dos en vez de avisar. Con reuse_port el bind nuevo
+        # "funciona", el cliente se conecta a la vieja y el discovery parece
+        # intermitente sin ningun error. Ver port.free_port.
         allow_broadcast=True,
     )
     log.info("Discovery UDP escuchando en puerto %d (nombre: %s)", port, server_name)

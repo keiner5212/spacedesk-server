@@ -224,6 +224,8 @@ class VirtualMonitorCapture:
         self._last_frame_lock = threading.Lock()
         self._logged_caps = False
         self._samples = 0
+        self._last_frame_at = 0.0
+        self._frame_event = threading.Event()
 
         # pipewiresrc integra PipeWire con el main context de GLib: sin un
         # main loop corriendo, el source nunca despacha y el pipeline queda en
@@ -382,17 +384,34 @@ class VirtualMonitorCapture:
                 except queue.Empty:
                     pass
             self._frame_queue.put(jpeg_bytes)
+        self._last_frame_at = time.monotonic()
+        self._frame_event.set()
         return Gst.FlowReturn.OK
 
-    def get_frame(self, timeout: float = 1.0) -> bytes | None:
-        """Devuelve el JPEG mas reciente. PipeWire solo emite un frame nuevo
-        cuando el monitor virtual cambia; si no llega uno dentro de `timeout`,
-        se repite el ultimo como keep-alive en vez de bloquear al cliente."""
-        try:
-            return self._frame_queue.get(timeout=timeout)
-        except queue.Empty:
+    def wait_frame(self, last_sent: bytes | None, keepalive: float,
+                   timeout: float = 5.0) -> tuple[bytes | None, bool]:
+        """Espera de forma evento-driven a que haya algo que mandar.
+
+        Devuelve el frame nuevo apenas el compositor lo produce, o el mismo
+        frame una vez pasado `keepalive` para que la app no piense que se corto
+        la conexion. Con la pantalla estatica NO se sondea en boucle: el
+        vigilante duerme en el Event y lo despierta `_on_sample`, asi que un
+        frame con contenido sale al instante en vez de esperar al timeout."""
+
+        deadline = time.monotonic() + timeout
+        while True:
             with self._last_frame_lock:
-                return self._last_frame
+                frame = self._last_frame
+            if frame is not None and frame != last_sent:
+                return frame, True
+            now = time.monotonic()
+            if frame is not None and keepalive and now - self._last_frame_at >= keepalive:
+                return frame, False
+            remaining = min(deadline, now + keepalive) - now if keepalive else deadline - now
+            if remaining <= 0 or now >= deadline:
+                return None, False
+            self._frame_event.wait(min(remaining, 0.25))
+            self._frame_event.clear()
 
     # -- permisos persistentes del portal --------------------------------
     def _load_tokens(self) -> None:

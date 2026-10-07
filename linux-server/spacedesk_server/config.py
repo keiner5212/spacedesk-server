@@ -27,6 +27,10 @@ DEFAULTS = {
         "jpeg_quality_min": "30",
         "jpeg_quality_max": "90",
         "target_fps": "20",
+        # Cada reenvio del mismo frame gasta un round trip completo, y ese
+        # round trip es justo donde se encola el proximo frame con novedad.
+        # 0 desactiva el keep-alive (la app puede quejarse de ancho de banda).
+        "keepalive_ms": "500",
         # 1 = oculto, 2 = dibujado en los pixeles del frame, 4 = metadata.
         "cursor_mode": "2",
         # Tipo de fuente del portal: 4 = VIRTUAL (monitor virtual real de KWin).
@@ -63,6 +67,7 @@ class Settings:
     jpeg_quality_min: int
     jpeg_quality_max: int
     target_fps: int
+    keepalive_ms: int
     cursor_mode: int
     source_type: int
     persist_permissions: bool
@@ -115,6 +120,7 @@ def load(path: str | Path | None = None) -> Settings:
         jpeg_quality_min=get_int("capture", "jpeg_quality_min"),
         jpeg_quality_max=get_int("capture", "jpeg_quality_max"),
         target_fps=get_int("capture", "target_fps"),
+        keepalive_ms=get_int("capture", "keepalive_ms"),
         cursor_mode=get_int("capture", "cursor_mode"),
         source_type=get_int("capture", "source_type"),
         persist_permissions=get_bool("capture", "persist_permissions"),
@@ -145,6 +151,8 @@ def _validate(settings: Settings) -> None:
         raise ConfigError("capture.jpeg_quality_min no puede ser mayor que jpeg_quality_max")
     if settings.target_fps <= 0:
         raise ConfigError(f"capture.target_fps debe ser positivo: {settings.target_fps}")
+    if settings.keepalive_ms < 0:
+        raise ConfigError(f"capture.keepalive_ms no puede ser negativo: {settings.keepalive_ms}")
     if settings.cursor_mode not in CURSOR_MODES:
         raise ConfigError(f"capture.cursor_mode debe ser uno de {CURSOR_MODES}: {settings.cursor_mode}")
     if settings.source_type not in (SOURCE_MONITOR, SOURCE_VIRTUAL, SOURCE_MONITOR | SOURCE_VIRTUAL):
