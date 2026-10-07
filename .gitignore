@@ -50,3 +50,6 @@ spacedesk_*.exe
 *.env
 *.local
 credentials/
+
+# Andamiaje temporal (APKs decompilados, herramientas, etc)
+.tmp/

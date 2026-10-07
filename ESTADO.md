@@ -46,8 +46,28 @@ most people want to run this.
 
 ## Findings worth keeping
 
-Things that were expensive to learn and are still true.
+Things that were expensive to learn and are still true. The ones marked
+CONFIRMED come from decompiling the official 4.8 APK with jadx, not from
+guessing.
 
+- **The tablet sends touches as PEN (13), not TOUCH (12).** CONFIRMED. The app
+  builds them in `C2641V1.m13082a()`/`m13083b()` straight from the touchscreen
+  `MotionEvent`. This server used to drop every one of them on the floor, which
+  is why nothing responded to touch. `protocol.PenPacket` + `input.handle_pen`
+  now handle them.
+- **The mouse `button_flags` at offset 20 is not a button mask.** CONFIRMED. It
+  is the state of a modifier key the app intercepts: `m12852o1(false)` from
+  `onKeyDown` becomes `8`, `m12852o1(true)` from `onKeyUp` becomes `16`
+  (`C2641V1.m13084c`). The old "any non-zero means left button" heuristic was
+  firing clicks on key release.
+- **Discovery is a 308 byte binary struct, not a text echo.** CONFIRMED. The app
+  receives with a buffer of exactly 308 (`C2547F2` calls `m13256c(308)`) and
+  parses it as `C2674f`: name in UTF-16LE at offset 0, IPv4 at 256, port at 260,
+  OS type at 264, capability flags at 280, all little-endian. Bit 16 of the
+  flags means "this server speaks TLS", which we must not set. Answering with
+  the `SPACEDESK-NET-CLIENT` magic, as the upstream project did, could never
+  work: the 20 byte reply is parsed as a 308 byte buffer, the name comes out
+  as garbage and the parse throws. See `protocol.build_discovery_response`.
 - **The app's drawing surface is always 1920x1200.** Its `Identification` packet
   says something else depending on the transport. Confirmed with
   `adb logcat`: `addSurfaceChangedCallback ... 0,0-1920,1200`. The framebuffer

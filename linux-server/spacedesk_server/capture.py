@@ -19,8 +19,8 @@ Por que el portal y no la API privada de Mutter que se usaba antes:
 
 Flujo: `RemoteDesktop.CreateSession` -> `SelectDevices` ->
 `ScreenCast.SelectSources(VIRTUAL)` -> `RemoteDesktop.Start` (dialogo del
-portal) -> `streams[]` con el `node_id` de PipeWire -> `OpenPipeWireRemote` ->
-pipeline GStreamer (`pipewiresrc fd=...` -> `jpegenc`) -> frames JPEG.
+portal) -> `streams[]` con el `node_id` de PipeWire -> pipeline GStreamer
+(`pipewiresrc path=<node_id>` -> `jpegenc`) -> frames JPEG.
 
 Limitacion conocida de Plasma 6.7: el output virtual se crea a 1920x1080 fijo
 (el `video/x-raw` del pipeline lo reescala al tamano configurado), y el
@@ -33,6 +33,7 @@ import logging
 import os
 import queue
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -81,8 +82,11 @@ class PortalClient:
     """Cliente minimo de los portales XDG sobre una `Gio.DBusConnection`.
 
     Cada metodo del portal devuelve un request de inmediato y entrega el
-    resultado despues en la senal `org.freedesktop.portal.Request.Response`,
-    asi que `_request` bloquea esperando esa senal con un main context local."""
+    resultado despues en la senal `org.freedesktop.portal.Request.Response`.
+    El hilo de trabajo no tiene main context propio, asi que la suscripcion
+    queda en el contexto global por defecto -- que es el que ya itera el hilo
+    dedicado de `VirtualMonitorCapture`. Correr un segundo main loop sobre el
+    mismo contexto hace fallar GLib."""
 
     def __init__(self, conn):
         self.conn = conn
@@ -94,11 +98,8 @@ class PortalClient:
         sender = self.conn.get_unique_name()[1:].replace(".", "_")
         request_path = f"{PORTAL_OBJECT_PATH}/request/{sender}/{token}"
 
-        context = GLib.MainContext.default()
-        context.push_thread_default()
-        loop = GLib.MainLoop(context=context)
         outcome: dict = {}
-        timeout_source = [None]
+        done = threading.Event()
 
         def on_signal(_conn, _sender, obj_path, _iface, signal, params):
             if obj_path != request_path:
@@ -107,20 +108,13 @@ class PortalClient:
                 outcome["code"], outcome["results"] = params.unpack()
             elif signal == "Close":
                 outcome["error"] = (params.unpack() or ["sesion cerrada por el portal"])[0]
-            loop.quit()
+            done.set()
 
         sub_id = self.conn.signal_subscribe(
             PORTAL_BUS_NAME, REQUEST_IFACE, None, request_path, None,
             Gio.DBusSignalFlags.NONE, on_signal,
         )
         try:
-            def on_timeout() -> bool:
-                timeout_source[0] = None
-                outcome.setdefault("error", "timeout esperando al portal")
-                loop.quit()
-                return False
-
-            timeout_source[0] = GLib.timeout_add(int(timeout * 1000), on_timeout)
             try:
                 self.conn.call_sync(
                     PORTAL_BUS_NAME, PORTAL_OBJECT_PATH, iface, method,
@@ -130,12 +124,10 @@ class PortalClient:
                 )
             except GLib.Error as exc:
                 raise PortalError(f"{iface}.{method}: {exc.message}") from exc
-            loop.run()
+            if not done.wait(timeout):
+                outcome.setdefault("error", "timeout esperando al portal")
         finally:
             self.conn.signal_unsubscribe(sub_id)
-            if timeout_source[0] is not None:
-                GLib.source_remove(timeout_source[0])
-            context.pop_thread_default()
 
         if "results" not in outcome:
             raise PortalError(f"{iface}.{method}: {outcome.get('error', 'sin respuesta del portal')}")
@@ -174,14 +166,6 @@ class PortalClient:
             REMOTEDESKTOP_IFACE, "Start", "osa{sv}", (session, ""), {},
         )
 
-    def open_pipewire_remote(self, session):
-        reply = self.conn.call_sync(
-            PORTAL_BUS_NAME, PORTAL_OBJECT_PATH, SCREENCAST_IFACE, "OpenPipeWireRemote",
-            GLib.Variant("(oa{sv})", (session, {})),
-            GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, -1, None,
-        )
-        return reply.unpack()[0]
-
     def close_session(self, session):
         try:
             self.conn.call_sync(
@@ -208,6 +192,10 @@ class VirtualMonitorCapture:
         source_type: int = SOURCE_VIRTUAL,
         cursor_mode: int = CURSOR_EMBEDDED,
         persist_permissions: bool = True,
+        adaptive_quality: bool = True,
+        jpeg_quality_min: int = 30,
+        jpeg_quality_max: int = 90,
+        target_latency: float = 0.25,
     ):
         self.width = width
         self.height = height
@@ -215,6 +203,15 @@ class VirtualMonitorCapture:
         self.source_type = source_type
         self.cursor_mode = cursor_mode
         self.persist_permissions = persist_permissions
+
+        self._adaptive_quality = adaptive_quality
+        self._quality_min = jpeg_quality_min
+        self._quality_max = jpeg_quality_max
+        self._target_latency = target_latency
+        self._latency: float | None = None
+        self._last_adjust = 0.0
+        self._warned_floor = False
+        self._encoder = None
 
         self.conn = None
         self.session_handle = None
@@ -230,6 +227,15 @@ class VirtualMonitorCapture:
         self._last_frame: bytes | None = None
         self._last_frame_lock = threading.Lock()
         self._logged_caps = False
+
+        # pipewiresrc integra PipeWire con el main context de GLib: sin un
+        # main loop corriendo, el source nunca despacha y el pipeline queda en
+        # PLAYING sin entregar un solo buffer.
+        self._loop = GLib.MainLoop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run, name="spacedesk-glib", daemon=True,
+        )
+        self._loop_thread.start()
 
     # -- ciclo de vida ---------------------------------------------------
     def start(self) -> None:
@@ -271,29 +277,108 @@ class VirtualMonitorCapture:
 
         self._save_tokens(results.get("restore_token"))
 
-        pipewire_fd = portal.open_pipewire_remote(self.session_handle)
+        # Sin `fd=`: se conecta al daemon de PipeWire del usuario y busca el
+        # node por id. La variante con fd heredado del portal (`OpenPipeWireRemote`)
+        # aborta el proceso al destruirse el pipeline: `source->loop ==
+        # &impl->loop failed at spa/plugins/support/loop.c: remove_from_poll()`.
+        # El node lo creamos nosotros en este mismo daemon, asi que es visible.
         self._pipeline = Gst.parse_launch(
-            f"pipewiresrc fd={pipewire_fd} path={node_id} ! "
+            f"pipewiresrc path={node_id} ! "
+            # El queue separa captura de codificacion: sin el, capturar,
+            # convertir, escalar y comprimir corren en un solo hilo y el frame
+            # se atrasesa. leaky=downstream descarta frames viejos en vez de
+            # acumularlos cuando el encoder no llega, que es lo que uno quiere
+            # en tiempo real.
+            f"queue leaky=downstream max-size-buffers=3 ! "
             # El output virtual de Plasma 6.7 sale a 1920x1080 fijo: el
             # videoscale es lo que hace que la tablet reciba exactamente el
-            # tamano configurado en config.ini.
-            f"videoconvert ! videoscale ! "
+            # tamano configurado en config.ini. method=0 es bilineal rapido.
+            f"videoconvert ! videoscale method=0 ! "
             f"video/x-raw,width={self.width},height={self.height},format=I420 ! "
-            f"jpegenc quality={self.jpeg_quality} ! "
+            f"jpegenc name=enc quality={self.jpeg_quality} ! "
             f"appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false"
         )
         sink = self._pipeline.get_by_name("sink")
         sink.connect("new-sample", self._on_sample)
+        self._encoder = self._pipeline.get_by_name("enc")
+        self._pipeline.get_bus().add_signal_watch()
+        self._pipeline.get_bus().connect("message", self._on_bus_message)
         self._pipeline.set_state(Gst.State.PLAYING)
         log.info("Pipeline de captura iniciado (%dx%d, jpeg=%d)", self.width, self.height, self.jpeg_quality)
+        GLib.timeout_add_seconds(15, self._warn_if_no_frames)
+
+    # -- calidad adaptativa ---------------------------------------------
+    def note_ack_latency(self, seconds: float) -> None:
+        """Latencia medida por el cliente: tiempo entre mandar un frame y que
+        llegue su FlowControlAck. Es la unica señal que tenemos del ancho de
+        banda real, e incluye la red mas lo que tarda la app."""
+        if not self._adaptive_quality or seconds <= 0:
+            return
+        self._latency = seconds if self._latency is None else self._latency * 0.8 + seconds * 0.2
+
+        now = time.monotonic()
+        if now - self._last_adjust < 3.0:
+            return
+        self._last_adjust = now
+
+        if self._latency > self._target_latency:
+            self._apply_quality(self.jpeg_quality - 5)
+            if self.jpeg_quality <= self._quality_min and not self._warned_floor:
+                self._warned_floor = True
+                log.warning(
+                    "Latencia alta (%.0f ms) con la calidad JPEG en el minimo (%d). "
+                    "Bajar capture.width/height es lo que mas va a ayudar.",
+                    self._latency * 1000, self.jpeg_quality,
+                )
+        elif self._latency < self._target_latency * 0.6:
+            self._apply_quality(self.jpeg_quality + 5)
+
+    def _apply_quality(self, quality: int) -> None:
+        low = max(1, self._quality_min)
+        high = min(100, self._quality_max)
+        quality = max(low, min(high, quality))
+        if quality == self.jpeg_quality:
+            return
+        self.jpeg_quality = quality
+        if self._encoder is not None:
+            self._encoder.set_property("quality", quality)
+        log.info("Calidad JPEG -> %d (latencia %.0f ms)", quality, (self._latency or 0) * 1000)
+
+    @property
+    def latency(self) -> float | None:
+        return self._latency
+
+    def _warn_if_no_frames(self) -> bool:
+        with self._last_frame_lock:
+            first = self._last_frame is None
+        if first:
+            log.error(
+                "El pipeline arranco pero no llego ningun frame en 15 s. Revisa los "
+                "mensajes de error del pipeline de arriba (log_level=DEBUG para el "
+                "estado exacto) y que el monitor virtual tenga contenido."
+            )
+        return False
+
+    def _on_bus_message(self, bus, message) -> None:
+        if message.type == Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            log.error("Error del pipeline de captura: %s (%s)", error, debug)
+        elif message.type == Gst.MessageType.EOS:
+            log.error("El stream de video termino (EOF); no llegan mas frames")
+        elif message.type == Gst.MessageType.STATE_CHANGED:
+            if message.src is self._pipeline:
+                _old, new, _pending = message.parse_state_changed()
+                log.debug("Pipeline -> %s", new.value_nick)
 
     def stop(self) -> None:
         if self._pipeline is not None:
+            self._pipeline.get_bus().remove_signal_watch()
             self._pipeline.set_state(Gst.State.NULL)
             self._pipeline = None
         if self.session_handle and self.conn is not None:
             PortalClient(self.conn).close_session(self.session_handle)
             self.session_handle = None
+        self._loop.quit()
 
     # -- frames ---------------------------------------------------------
     def _on_sample(self, appsink):

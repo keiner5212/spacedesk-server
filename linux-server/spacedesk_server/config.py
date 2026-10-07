@@ -14,11 +14,17 @@ DEFAULTS = {
     "server": {
         "port": "28252",
         "log_level": "INFO",
+        "name": "spacedesk-linux",
     },
     "capture": {
-        "width": "1920",
-        "height": "1200",
+        "width": "1600",
+        "height": "900",
         "jpeg_quality": "55",
+        # Ajuste automatico de la calidad segun la latencia medida.
+        "adaptive_quality": "true",
+        "jpeg_quality_min": "30",
+        "jpeg_quality_max": "90",
+        "target_latency_ms": "250",
         # 1 = oculto, 2 = dibujado en los pixeles del frame, 4 = metadata.
         "cursor_mode": "2",
         # Tipo de fuente del portal: 4 = VIRTUAL (monitor virtual real de KWin).
@@ -46,9 +52,14 @@ class ConfigError(Exception):
 class Settings:
     port: int
     log_level: str
+    name: str
     width: int
     height: int
     jpeg_quality: int
+    adaptive_quality: bool
+    jpeg_quality_min: int
+    jpeg_quality_max: int
+    target_latency_ms: int
     cursor_mode: int
     source_type: int
     persist_permissions: bool
@@ -56,8 +67,8 @@ class Settings:
 
     def describe(self) -> str:
         return (
-            f"puerto={self.port} framebuffer={self.width}x{self.height} "
-            f"jpeg={self.jpeg_quality} fuente={self.source_type} "
+            f"puerto={self.port} nombre={self.name!r} framebuffer={self.width}x{self.height} "
+            f"jpeg={self.jpeg_quality}{'*' if self.adaptive_quality else ''} fuente={self.source_type} "
             f"cursor={self.cursor_mode} discovery={'on' if self.discovery_enabled else 'off'}"
         )
 
@@ -91,9 +102,14 @@ def load(path: str | Path | None = None) -> Settings:
     settings = Settings(
         port=get_int("server", "port"),
         log_level=parser.get("server", "log_level", fallback=DEFAULTS["server"]["log_level"]).strip().upper(),
+        name=parser.get("server", "name", fallback=DEFAULTS["server"]["name"]).strip() or "spacedesk-linux",
         width=get_int("capture", "width"),
         height=get_int("capture", "height"),
         jpeg_quality=get_int("capture", "jpeg_quality"),
+        adaptive_quality=get_bool("capture", "adaptive_quality"),
+        jpeg_quality_min=get_int("capture", "jpeg_quality_min"),
+        jpeg_quality_max=get_int("capture", "jpeg_quality_max"),
+        target_latency_ms=get_int("capture", "target_latency_ms"),
         cursor_mode=get_int("capture", "cursor_mode"),
         source_type=get_int("capture", "source_type"),
         persist_permissions=get_bool("capture", "persist_permissions"),
@@ -106,10 +122,20 @@ def load(path: str | Path | None = None) -> Settings:
 def _validate(settings: Settings) -> None:
     if not 1 <= settings.port <= 65535:
         raise ConfigError(f"server.port fuera de rango: {settings.port}")
+    if len(settings.name.encode("utf-16-le")) > 256:
+        raise ConfigError("server.name es demasiado largo (maximo 128 caracteres)")
     if settings.width <= 0 or settings.height <= 0:
         raise ConfigError(f"capture.width/height deben ser positivos: {settings.width}x{settings.height}")
     if not 1 <= settings.jpeg_quality <= 100:
         raise ConfigError(f"capture.jpeg_quality fuera de rango (1-100): {settings.jpeg_quality}")
+    if not 1 <= settings.jpeg_quality_min <= 100:
+        raise ConfigError(f"capture.jpeg_quality_min fuera de rango (1-100): {settings.jpeg_quality_min}")
+    if not 1 <= settings.jpeg_quality_max <= 100:
+        raise ConfigError(f"capture.jpeg_quality_max fuera de rango (1-100): {settings.jpeg_quality_max}")
+    if settings.jpeg_quality_min > settings.jpeg_quality_max:
+        raise ConfigError("capture.jpeg_quality_min no puede ser mayor que jpeg_quality_max")
+    if settings.target_latency_ms <= 0:
+        raise ConfigError(f"capture.target_latency_ms debe ser positivo: {settings.target_latency_ms}")
     if settings.cursor_mode not in CURSOR_MODES:
         raise ConfigError(f"capture.cursor_mode debe ser uno de {CURSOR_MODES}: {settings.cursor_mode}")
     if settings.source_type not in (SOURCE_MONITOR, SOURCE_VIRTUAL, SOURCE_MONITOR | SOURCE_VIRTUAL):

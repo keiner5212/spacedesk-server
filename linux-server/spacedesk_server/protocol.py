@@ -26,6 +26,19 @@ PROTOCOL_VERSION_MINOR = 8
 
 DISCOVERY_PORT = 28252
 DISCOVERY_MAGIC = b"SPACEDESK-NET-CLIENT\x00"
+DISCOVERY_RESPONSE_LEN = 308
+# La respuesta de discovery NO es un eco del magic: la app espera un struct
+# binario de 308 bytes (ph.spacedesk...C2745w2 / C2674f / C2547F2, que recibe
+# con un buffer de exactamente 308). Layout, todos los ints little-endian:
+#   [0:256]   nombre del servidor en UTF-16LE, terminador en null
+#   [256:260] IPv4 del servidor (la app la sobreescribe con la origen del datagrama)
+#   [260:264] puerto
+#   [264:268] tipo de OS (0 = UNKNOWN; el enum de la app no tiene Linux)
+#   [268:280] reservado
+#   [280:284] capabilities: bits 0-1 = hay nombre y OS. NO activar el bit 4
+#             (16) porque la app interpretaria el servidor como TLS 1.3.
+DISCOVERY_OS_UNKNOWN = 0
+DISCOVERY_CAP_BASIC = 3
 
 
 class HeaderType(enum.IntEnum):
@@ -147,9 +160,52 @@ def get_i16(buf: bytes, offset: int) -> int:
     return struct.unpack_from("<h", buf, offset)[0]
 
 
+def get_f32(buf: bytes, offset: int) -> float:
+    return struct.unpack_from("<f", buf, offset)[0]
+
+
+def get_u8(buf: bytes, offset: int) -> int:
+    return buf[offset]
+
+
 def header_type(header: bytes) -> int:
     """Lee offset 0: tipo de mensaje (HeaderType), igual en todos los tipos de paquete."""
     return get_i32(header, 0)
+
+
+def build_discovery_response(name: str, port: int, address: str) -> bytes:
+    """Struct de 308 bytes que la app espera en respuesta a su broadcast."""
+    buf = bytearray(DISCOVERY_RESPONSE_LEN)
+    encoded = name.encode("utf-16-le")[:256]
+    buf[0:len(encoded)] = encoded
+    # La IP va como uint32: con set_i32 (con signo) cualquier direccion cuyo
+    # primer octeto sea >= 128 desborda el int32 y rompe la respuesta.
+    set_u32(buf, 256, ipv4_to_int(address))
+    set_i32(buf, 260, port)
+    set_i32(buf, 264, DISCOVERY_OS_UNKNOWN)
+    set_u32(buf, 280, DISCOVERY_CAP_BASIC)
+    return bytes(buf)
+
+
+def ipv4_to_int(address: str) -> int:
+    octets = address.split(".")
+    if len(octets) != 4:
+        raise ValueError(f"direccion IPv4 invalida: {address!r}")
+    value = 0
+    for index, octet in enumerate(octets):
+        number = int(octet)
+        if not 0 <= number <= 255:
+            raise ValueError(f"octeto invalido en {address!r}")
+        value |= number << (24 - 8 * index)
+    return value
+
+
+def header_name(htype: int) -> str:
+    """Nombre legible del tipo de paquete, marcando los que no conocemos."""
+    try:
+        return f"{HeaderType(htype).name}({htype})"
+    except ValueError:
+        return f"DESCONOCIDO({htype})"
 
 
 def payload_length(header: bytes) -> int:
@@ -194,6 +250,10 @@ class IdentificationPacket:
 
     def effective_height(self) -> int:
         return self.height_custom if self.resolution_mode == 2 and self.height_custom else self.height
+
+    def fields(self) -> dict:
+        """Todos los campos leidos, para detectar drift del protocolo."""
+        return {name: getattr(self, name) for name in self.__slots__}
 
     def __repr__(self) -> str:
         return (
@@ -285,11 +345,59 @@ class TouchPacket:
 
 
 # ---------------------------------------------------------------------------
-# Mouse (cliente -> servidor). Layout de offsets CONFIRMADO (V1.c() + JS), pero
-# los valores exactos del bitmask de botones (Wheel/LeftDown/LeftUp/RightDown/
-# RightUp) NO están confirmados con evidencia decompilada -- solo se vio el
-# nombre del enum en el JS, no su valor numérico. Aproximación razonable abajo,
-# pendiente de validar con adb logcat.
+# Pen (cliente -> servidor). CONFIRMADO decompilando el APK oficial:
+# `C2641V1.m13082a()` / `m13083b()` construyen estos headers desde el
+# MotionEvent del touchscreen, NO desde el raton. O sea que la tablet manda los
+# toques como PEN(13), no como TOUCH(12).
+#
+# Layout (offsets de `C2670e`, todos little-endian):
+#   [0:4]    tipo = 13 (PEN)
+#   [4:8]    payload = 0
+#   [8:12]   ancho de la superficie del cliente (m13161S -> f11206W = 8)
+#   [12:16]  alto de la superficie del cliente (m13162T -> f11207X = 12)
+#   [16:20]  x en float (m13163U -> f11208Y = 16)
+#   [20:24]  y en float (m13164V -> f11209Z = 20)
+#   [32:36]  presion en float (m13160R -> f11210a0 = 32)
+#   [36]     down/up: 1 = pulsado o arrastrando, 0 = soltar
+#            (`i3 = (getAction() == ACTION_UP) ? 0 : 1` en m13083b)
+#   [39]     siempre 1
+#
+# Ojo: el paquete NO distingue DOWN de MOVE (ambos valen 1). El servidor tiene
+# que deducirlo del estado previo del puntero, ver `input.VirtualInput`.
+# ---------------------------------------------------------------------------
+
+class PenPacket:
+    __slots__ = ("x", "y", "res_x", "res_y", "pressure", "is_down")
+
+    @classmethod
+    def parse(cls, header: bytes) -> "PenPacket":
+        pkt = cls()
+        pkt.res_x = get_i32(header, 8)
+        pkt.res_y = get_i32(header, 12)
+        pkt.x = int(get_f32(header, 16))
+        pkt.y = int(get_f32(header, 20))
+        pkt.pressure = get_f32(header, 32)
+        pkt.is_down = get_u8(header, 36) != 0
+        return pkt
+
+    def __repr__(self) -> str:
+        return (
+            f"PenPacket(x={self.x}, y={self.y}, res={self.res_x}x{self.res_y}, "
+            f"pressure={self.pressure:.2f}, down={self.is_down})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mouse (cliente -> servidor). Layout de offsets CONFIRMADO decompilando el
+# APK: `C2641V1.m13084c()` escribe tipo@0, payload@4, x@8, y@12, rueda@16,
+# flags@20, extra@24.
+#
+# PERO el campo de offset 20 NO es una mascara de botones: es el estado de la
+# tecla modificadora que la app intercepta. `SAActivityDisplay.m12809X0()`
+# (onKeyDown) llama `m12852o1(false)` y `m12811Y0()` (onKeyUp) llama
+# `m12852o1(true)`; `m13084c` traduce eso a `i3 = z2 ? 16 : 8`. O sea:
+# 8 = modificadora presionada, 16 = modificadora soltada. Los botones de verdad
+# llegan por PEN, no por MOUSE.
 # ---------------------------------------------------------------------------
 
 class MousePacket:

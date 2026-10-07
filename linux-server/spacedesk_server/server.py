@@ -14,8 +14,10 @@ conectados (es "la" pantalla extendida del PC, no una por cliente).
 """
 
 import asyncio
+import collections
 import logging
 import socket
+import time
 
 from . import protocol as proto
 from . import ws_transport
@@ -126,6 +128,10 @@ class SharedCapture:
                     source_type=settings.source_type,
                     cursor_mode=settings.cursor_mode,
                     persist_permissions=settings.persist_permissions,
+                    adaptive_quality=settings.adaptive_quality,
+                    jpeg_quality_min=settings.jpeg_quality_min,
+                    jpeg_quality_max=settings.jpeg_quality_max,
+                    target_latency=settings.target_latency_ms / 1000,
                 )
                 loop = asyncio.get_event_loop()
                 try:
@@ -186,6 +192,8 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
         return
     ident = proto.IdentificationPacket.parse(header)
     log.info("Cliente identificado (%s): %r", addr, ident)
+    log.debug("Identification completa de %s: %s", addr, ident.fields())
+    log.debug("Identification header de %s: %s", addr, header.hex())
 
     # El tamano del framebuffer y la calidad JPEG salen de config.ini. La app
     # NO hace "fit to screen": muestra el frame a 1:1, asi que un framebuffer
@@ -202,12 +210,19 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     vinput = VirtualInput(
         capture.conn, capture.session_handle, capture.stream_node_id,
         capture.stream_width, capture.stream_height,
+        ident.effective_width(), ident.effective_height(),
     )
     ack_event = asyncio.Event()
     ack_event.set()  # listo para mandar el primer frame sin esperar ACK previo
     stop_event = asyncio.Event()
+    seen_types: collections.Counter = collections.Counter()
+    sent_at: float | None = None
+    frames_sent = 0
+    bytes_sent = 0
+    window_start = time.monotonic()
 
     async def sender() -> None:
+        nonlocal sent_at, frames_sent, bytes_sent, window_start
         loop = asyncio.get_event_loop()
         while not stop_event.is_set():
             try:
@@ -239,12 +254,29 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 fragment_info=0,
             )
             try:
+                sent_at = time.monotonic()
                 await conn.write_packet(fb_header, jpeg)
+                frames_sent += 1
+                bytes_sent += len(jpeg)
             except (ConnectionError, OSError):
                 stop_event.set()
                 break
+            now = time.monotonic()
+            if now - window_start >= 5.0:
+                latency = capture.latency
+                log.info(
+                    "Stats: %.1f fps, %.0f KB/frame, latencia ACK %s, jpeg=%d, %dx%d",
+                    frames_sent / (now - window_start),
+                    bytes_sent / frames_sent / 1024,
+                    f"{latency * 1000:.0f} ms" if latency else "n/d",
+                    capture.jpeg_quality, capture.width, capture.height,
+                )
+                frames_sent = 0
+                bytes_sent = 0
+                window_start = now
 
     async def receiver() -> None:
+        nonlocal sent_at
         loop = asyncio.get_event_loop()
         while not stop_event.is_set():
             result = await conn.read_packet()
@@ -253,14 +285,24 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 break
             header, _payload = result
             htype = proto.header_type(header)
+            seen_types[htype] += 1
+            log.debug("<- %s payload=%dB header=%s",
+                      proto.header_name(htype), proto.payload_length(header), header.hex())
             if htype == proto.HeaderType.FLOW_CONTROL_ACK:
                 ack_event.set()
+                if sent_at is not None:
+                    capture.note_ack_latency(time.monotonic() - sent_at)
+                    sent_at = None
             elif htype == proto.HeaderType.TOUCH:
                 # vinput.* hace una llamada D-Bus sincrona (call_sync) -- sin
                 # el executor, cada touch/mouse/key bloquearia el loop entero
                 # de asyncio (frenando tambien el envio de frames), que es
                 # justo la lentitud reportada al probar con la tablet real.
                 await loop.run_in_executor(None, vinput.handle_touch, proto.TouchPacket.parse(header))
+            elif htype == proto.HeaderType.PEN:
+                # La tablet manda los toques del touchscreen por aqui (ver
+                # protocol.PenPacket). Sin esto el input se descarta entero.
+                await loop.run_in_executor(None, vinput.handle_pen, proto.PenPacket.parse(header))
             elif htype == proto.HeaderType.MOUSE:
                 await loop.run_in_executor(None, vinput.handle_mouse, proto.MousePacket.parse(header))
             elif htype == proto.HeaderType.KEYBOARD:
@@ -272,7 +314,10 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
             elif htype == proto.HeaderType.PING:
                 pass  # TODO: responder Pong si se confirma que la app lo requiere
             else:
-                log.debug("Paquete tipo %s sin manejar de %s", htype, addr)
+                # A WARNING y no DEBUG: un tipo que no manejamos puede ser
+                # drift del protocolo y tiene que verse sin --debug.
+                log.warning("Paquete %s sin manejar de %s: header=%s",
+                            proto.header_name(htype), addr, header.hex())
 
     sender_task = asyncio.create_task(sender())
     receiver_task = asyncio.create_task(receiver())
@@ -281,6 +326,8 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     receiver_task.cancel()
     vinput.close()
     conn.close()
+    log.info("Paquetes recibidos de %s: %s", addr, ", ".join(
+        f"{proto.header_name(t)}={c}" for t, c in sorted(seen_types.items())))
     log.info("Conexion cerrada: %s", addr)
 
 
@@ -293,7 +340,7 @@ async def run_server(settings: Settings) -> None:
 
     shared_capture = SharedCapture(settings)
     if settings.discovery_enabled:
-        await start_discovery_responder(settings.port)
+        await start_discovery_responder(settings.port, settings.name)
 
     server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, shared_capture), "0.0.0.0", settings.port

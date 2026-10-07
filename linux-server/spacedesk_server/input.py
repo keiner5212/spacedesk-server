@@ -22,7 +22,7 @@ import logging
 from evdev import ecodes as e
 from gi.repository import Gio, GLib
 
-from .protocol import KeyboardPacket, MousePacket, TouchAction, TouchPacket
+from .protocol import KeyboardPacket, MousePacket, PenPacket, TouchAction, TouchPacket
 
 log = logging.getLogger("spacedesk.input")
 
@@ -53,8 +53,12 @@ class VirtualInput:
     """`stream_width`/`stream_height` son el tamano logico del stream de
     PipeWire (el espacio en el que `NotifyTouchDown` /
     `NotifyPointerMotionAbsolute` esperan recibir x/y). `stream_node_id` es el
-    `node_id` de PipeWire que devolvio `RemoteDesktop.Start`. `conn` es la
-    misma `Gio.DBusConnection` que usa `VirtualMonitorCapture`."""
+    `node_id` de PipeWire que devolvio `RemoteDesktop.Start`. `client_width` /
+    `client_height` son la resolucion que la tablet reporto en su
+    `Identification`: los paquetes de mouse no llevan su propio tamano, asi que
+    se asume que sus coordenadas absolutas vienen en ese espacio (los de touch
+    si lo traien, en `res_x`/`res_y`). `conn` es la misma
+    `Gio.DBusConnection` que usa `VirtualMonitorCapture`."""
 
     def __init__(
         self,
@@ -63,13 +67,18 @@ class VirtualInput:
         stream_node_id: int,
         stream_width: int,
         stream_height: int,
+        client_width: int = 0,
+        client_height: int = 0,
     ):
         self.conn = conn
         self.session_handle = session_handle
         self.stream_node_id = stream_node_id
         self.stream_width = stream_width
         self.stream_height = stream_height
+        self.client_width = client_width or stream_width
+        self.client_height = client_height or stream_height
         self._mouse_buttons_down = 0
+        self._pointers_down: set = set()
 
     def close(self) -> None:
         pass  # la sesion la cierra VirtualMonitorCapture.stop(), compartida entre clientes
@@ -96,8 +105,32 @@ class VirtualInput:
         sy = max(0.0, min(self.stream_height - 1, sy))
         return sx, sy
 
+    # -- Pen: la app manda los toques del touchscreen como PEN, no como TOUCH. El
+    # paquete solo dice "pulsado o soltado" (offset 36), asi que el DOWN se
+    # deduce del primer paquete con el puntero todavia abajo.
+    def handle_pen(self, pkt: PenPacket) -> None:
+        log.debug("Pen %s", pkt)
+        slot = 0
+        if pkt.is_down:
+            action = TouchAction.MOVE if slot in self._pointers_down else TouchAction.DOWN
+            self._pointers_down.add(slot)
+        else:
+            if slot not in self._pointers_down:
+                return
+            self._pointers_down.discard(slot)
+            action = TouchAction.UP
+
+        x, y = self._scale(pkt.x, pkt.y, pkt.res_x, pkt.res_y)
+        if action == TouchAction.DOWN:
+            self._call("NotifyTouchDown", "(oa{sv}uudd)", (self.stream_node_id, slot, x, y))
+        elif action == TouchAction.MOVE:
+            self._call("NotifyTouchMotion", "(oa{sv}uudd)", (self.stream_node_id, slot, x, y))
+        else:
+            self._call("NotifyTouchUp", "(oa{sv}u)", (slot,))
+
     # -- Touch: alta confianza, layout y action codes confirmados (ver protocol.py) --
     def handle_touch(self, pkt: TouchPacket) -> None:
+        log.debug("Touch %s", pkt)
         x, y = self._scale(pkt.x, pkt.y, pkt.res_x, pkt.res_y)
         slot = pkt.pointer_id
 
@@ -113,14 +146,21 @@ class VirtualInput:
             log.debug("TouchAction desconocido: %s", pkt.action)
 
     # -- Mouse: posicion absoluta confirmada; bits exactos de button_flags NO
-    # confirmados contra codigo decompilado -- best effort, validar con logcat. --
+    # confirmados contra codigo decompilado -- best effort, validar con logcat.
+    # El enum del protocolo parece ser LeftDown/LeftUp/RightDown/RightUp/Wheel
+    # (evento, no mascara de botones pulses), asi que con `log_level = DEBUG`
+    # hay que ver que valores llegan antes de cambiar la logica de abajo.
     def handle_mouse(self, pkt: MousePacket) -> None:
+        log.debug("Mouse %s", pkt)
+
         if pkt.wheel_delta:
             steps = 1 if pkt.wheel_delta > 0 else -1
             self._call("NotifyPointerAxisDiscrete", "(oa{sv}ui)", (0, steps))
 
         if pkt.x or pkt.y:
-            x, y = self._scale(pkt.x, pkt.y, self.stream_width, self.stream_height)
+            x, y = self._scale(pkt.x, pkt.y, self.client_width, self.client_height)
+            log.debug("  -> NotifyPointerMotionAbsolute(stream=%s, %.0f, %.0f)",
+                      self.stream_node_id, x, y)
             self._call("NotifyPointerMotionAbsolute", "(oa{sv}udd)",
                        (self.stream_node_id, x, y))
 
@@ -130,6 +170,7 @@ class VirtualInput:
         is_down = pkt.button_flags != 0
         was_down = self._mouse_buttons_down != 0
         if is_down != was_down:
+            log.debug("  -> NotifyPointerButton(BTN_LEFT, %s)", 1 if is_down else 0)
             self._call("NotifyPointerButton", "(oa{sv}iu)", (e.BTN_LEFT, 1 if is_down else 0))
         self._mouse_buttons_down = pkt.button_flags
 

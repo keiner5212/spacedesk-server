@@ -51,6 +51,11 @@ status of the prerequisites.
 Then open the spacedesk app on the tablet. It finds the server automatically
 over WiFi (UDP broadcast on port 28252), or you can type the PC IP in by hand.
 
+Discovery works by replying to the app's broadcast with the 308 byte struct it
+expects (name in UTF-16LE, IP, port, OS type, capability flags). See
+`protocol.build_discovery_response`. Set the name shown in the app's server list
+with `server.name` in `config.ini`.
+
 **The first time a client connects**, a KDE permission dialog appears asking to
 share the screen and the input device. Approve it. A virtual monitor is created
 and shows up in your display settings, so you can drag windows onto it.
@@ -62,6 +67,7 @@ Everything is in `linux-server/config.ini`.
 | Option | Default | What it does |
 | --- | --- | --- |
 | `server.port` | 28252 | Data and discovery port |
+| `server.name` | spacedesk-linux | Name shown in the app's server list |
 | `server.log_level` | INFO | DEBUG / INFO / WARNING / ERROR |
 | `capture.width` / `capture.height` | 1920 / 1200 | Framebuffer size shown on the tablet (1:1, never scaled) |
 | `capture.jpeg_quality` | 55 | JPEG quality. 55-75 over WiFi, 90-100 on a fast network |
@@ -102,6 +108,27 @@ linux-server/
 More detail: [SYSTEM_REQUIREMENTS.md](SYSTEM_REQUIREMENTS.md) for the system
 packages and how to verify them, [ESTADO.md](ESTADO.md) for what was tried and
 what still needs checking with a real tablet.
+
+## Diagnosing
+
+```bash
+./start.sh --debug
+```
+
+`--debug` logs every packet the client sends (type, payload length and the raw
+128 byte header in hex), the full `Identification` fields, and the GStreamer
+pipeline state.
+
+Two things are logged at every log level because they mean protocol drift:
+
+- `Paquete DESCONOCIDO(N) sin manejar` - a packet type the server does not know.
+  If the app starts sending types this server has no handler for, the protocol
+  moved and `protocol.py` needs updating.
+- `Paquetes recibidos de <addr>: ...` - a census per connection. Useful to see
+  at a glance what the client actually sends.
+
+Currently unimplemented but defined in the protocol: `DISPLAY_SETTINGS(4)`,
+`ROTATION(9)` and `AUDIO(14)`.
 
 ## Troubleshooting
 
