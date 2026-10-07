@@ -1,0 +1,5 @@
+# spacedesk USB / Android Open Accessory (AOA)
+# Da acceso al usuario de la sesion activa a la tablet, tanto en modo normal
+# (HONOR 339b:107d) como cuando entra en accessory mode (Google 18d1:2dxx).
+SUBSYSTEM=="usb", ATTR{idVendor}=="339b", ATTR{idProduct}=="107d", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0660", GROUP="plugdev", TAG+="uaccess"

@@ -1,0 +1,7 @@
+# SpaceDesk Linux Server — Dependencias Python
+
+# Transporte USB (Android Open Accessory)
+pyusb==1.2.1
+
+# Nota: PyGObject (gi) debe venir del sistema, no se instala vía pip
+# Ver README.md para instrucciones de instalación de dependencias del sistema
