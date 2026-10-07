@@ -15,6 +15,8 @@ DEFAULTS = {
         "port": "28252",
         "log_level": "INFO",
         "name": "spacedesk-linux",
+        # Frames sin confirmar a la vez. 1 = estricto con el protocolo.
+        "in_flight_frames": "1",
     },
     "capture": {
         "width": "1600",
@@ -24,7 +26,7 @@ DEFAULTS = {
         "adaptive_quality": "true",
         "jpeg_quality_min": "30",
         "jpeg_quality_max": "90",
-        "target_latency_ms": "250",
+        "target_fps": "20",
         # 1 = oculto, 2 = dibujado en los pixeles del frame, 4 = metadata.
         "cursor_mode": "2",
         # Tipo de fuente del portal: 4 = VIRTUAL (monitor virtual real de KWin).
@@ -53,13 +55,14 @@ class Settings:
     port: int
     log_level: str
     name: str
+    in_flight_frames: int
     width: int
     height: int
     jpeg_quality: int
     adaptive_quality: bool
     jpeg_quality_min: int
     jpeg_quality_max: int
-    target_latency_ms: int
+    target_fps: int
     cursor_mode: int
     source_type: int
     persist_permissions: bool
@@ -67,7 +70,8 @@ class Settings:
 
     def describe(self) -> str:
         return (
-            f"puerto={self.port} nombre={self.name!r} framebuffer={self.width}x{self.height} "
+            f"puerto={self.port} nombre={self.name!r} en_vuelo={self.in_flight_frames} "
+            f"framebuffer={self.width}x{self.height} "
             f"jpeg={self.jpeg_quality}{'*' if self.adaptive_quality else ''} fuente={self.source_type} "
             f"cursor={self.cursor_mode} discovery={'on' if self.discovery_enabled else 'off'}"
         )
@@ -103,13 +107,14 @@ def load(path: str | Path | None = None) -> Settings:
         port=get_int("server", "port"),
         log_level=parser.get("server", "log_level", fallback=DEFAULTS["server"]["log_level"]).strip().upper(),
         name=parser.get("server", "name", fallback=DEFAULTS["server"]["name"]).strip() or "spacedesk-linux",
+        in_flight_frames=get_int("server", "in_flight_frames"),
         width=get_int("capture", "width"),
         height=get_int("capture", "height"),
         jpeg_quality=get_int("capture", "jpeg_quality"),
         adaptive_quality=get_bool("capture", "adaptive_quality"),
         jpeg_quality_min=get_int("capture", "jpeg_quality_min"),
         jpeg_quality_max=get_int("capture", "jpeg_quality_max"),
-        target_latency_ms=get_int("capture", "target_latency_ms"),
+        target_fps=get_int("capture", "target_fps"),
         cursor_mode=get_int("capture", "cursor_mode"),
         source_type=get_int("capture", "source_type"),
         persist_permissions=get_bool("capture", "persist_permissions"),
@@ -120,6 +125,10 @@ def load(path: str | Path | None = None) -> Settings:
 
 
 def _validate(settings: Settings) -> None:
+    if not 1 <= settings.in_flight_frames <= 4:
+        raise ConfigError(
+            f"server.in_flight_frames fuera de rango (1-4): {settings.in_flight_frames}"
+        )
     if not 1 <= settings.port <= 65535:
         raise ConfigError(f"server.port fuera de rango: {settings.port}")
     if len(settings.name.encode("utf-16-le")) > 256:
@@ -134,8 +143,8 @@ def _validate(settings: Settings) -> None:
         raise ConfigError(f"capture.jpeg_quality_max fuera de rango (1-100): {settings.jpeg_quality_max}")
     if settings.jpeg_quality_min > settings.jpeg_quality_max:
         raise ConfigError("capture.jpeg_quality_min no puede ser mayor que jpeg_quality_max")
-    if settings.target_latency_ms <= 0:
-        raise ConfigError(f"capture.target_latency_ms debe ser positivo: {settings.target_latency_ms}")
+    if settings.target_fps <= 0:
+        raise ConfigError(f"capture.target_fps debe ser positivo: {settings.target_fps}")
     if settings.cursor_mode not in CURSOR_MODES:
         raise ConfigError(f"capture.cursor_mode debe ser uno de {CURSOR_MODES}: {settings.cursor_mode}")
     if settings.source_type not in (SOURCE_MONITOR, SOURCE_VIRTUAL, SOURCE_MONITOR | SOURCE_VIRTUAL):

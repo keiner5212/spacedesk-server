@@ -69,8 +69,11 @@ Everything is in `linux-server/config.ini`.
 | `server.port` | 28252 | Data and discovery port |
 | `server.name` | spacedesk-linux | Name shown in the app's server list |
 | `server.log_level` | INFO | DEBUG / INFO / WARNING / ERROR |
-| `capture.width` / `capture.height` | 1920 / 1200 | Framebuffer size shown on the tablet (1:1, never scaled) |
-| `capture.jpeg_quality` | 55 | JPEG quality. 55-75 over WiFi, 90-100 on a fast network |
+| `capture.width` / `capture.height` | 1600 / 900 | Framebuffer shown on the tablet (1:1, never scaled). Lowering it is the most effective lever against lag |
+| `capture.jpeg_quality` | 55 | Starting JPEG quality |
+| `capture.adaptive_quality` | true | Adjust quality automatically to hold the latency target |
+| `capture.jpeg_quality_min` / `max` | 30 / 90 | Bounds for the automatic adjustment |
+| `capture.target_latency_ms` | 250 | Latency the automatic adjustment aims for |
 | `capture.cursor_mode` | 2 | 1 hidden, 2 drawn into the frame, 4 as stream metadata |
 | `capture.source_type` | 4 | 4 virtual monitor, 1 mirror a physical screen, 5 ask |
 | `capture.persist_permissions` | true | Remember the permission dialog between runs |
@@ -129,6 +132,40 @@ Two things are logged at every log level because they mean protocol drift:
 
 Currently unimplemented but defined in the protocol: `DISPLAY_SETTINGS(4)`,
 `ROTATION(9)` and `AUDIO(14)`.
+
+## Performance
+
+The protocol forces the server to wait for the tablet's `FlowControlAck` before
+sending the next frame, so **fps is roughly the inverse of the round trip**: a
+bigger frame takes longer to transfer and decode, which delays its own ACK. That
+is why cutting JPEG quality alone barely moved the frame rate - it was only part
+of the loop.
+
+While a client is connected the server logs real numbers every 5 seconds:
+
+```
+Stats: enviados 12.4 fps (58 KB/frame), capturado 30.0 fps, latencia ACK 190 ms, jpeg=42, 1600x900
+```
+
+- `enviados` is what the tablet is actually getting.
+- `capturado` is what the desktop is producing. If that one is high and
+  `enviados` is low, the bottleneck is the tablet or the network, not the PC.
+
+With `capture.adaptive_quality = true` the JPEG quality moves in steps to hold
+`capture.target_fps`, and never exceeds the quality the tablet asks for in its
+`Identification`.
+
+Things that matter, roughly in order:
+
+1. **Total bytes per frame**, which is resolution times JPEG quality. Two frames
+   with the same size cost the same, so 1280x720 at quality 70 looks sharper
+   than 1600x900 at quality 35.
+2. **JPEG quality.** What the automatic mode adjusts.
+3. **The keep-alive.** When nothing changes on screen the last frame repeats
+   briefly so the app does not report low bandwidth.
+
+The PC side is not the constraint here: the capture pipeline sustains the full
+30 fps of the stream at 1600x900 on this machine.
 
 ## Troubleshooting
 

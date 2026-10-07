@@ -195,7 +195,6 @@ class VirtualMonitorCapture:
         adaptive_quality: bool = True,
         jpeg_quality_min: int = 30,
         jpeg_quality_max: int = 90,
-        target_latency: float = 0.25,
     ):
         self.width = width
         self.height = height
@@ -207,10 +206,7 @@ class VirtualMonitorCapture:
         self._adaptive_quality = adaptive_quality
         self._quality_min = jpeg_quality_min
         self._quality_max = jpeg_quality_max
-        self._target_latency = target_latency
         self._latency: float | None = None
-        self._last_adjust = 0.0
-        self._warned_floor = False
         self._encoder = None
 
         self.conn = None
@@ -227,6 +223,7 @@ class VirtualMonitorCapture:
         self._last_frame: bytes | None = None
         self._last_frame_lock = threading.Lock()
         self._logged_caps = False
+        self._samples = 0
 
         # pipewiresrc integra PipeWire con el main context de GLib: sin un
         # main loop corriendo, el source nunca despacha y el pipeline queda en
@@ -284,15 +281,12 @@ class VirtualMonitorCapture:
         # El node lo creamos nosotros en este mismo daemon, asi que es visible.
         self._pipeline = Gst.parse_launch(
             f"pipewiresrc path={node_id} ! "
-            # El queue separa captura de codificacion: sin el, capturar,
-            # convertir, escalar y comprimir corren en un solo hilo y el frame
-            # se atrasesa. leaky=downstream descarta frames viejos en vez de
-            # acumularlos cuando el encoder no llega, que es lo que uno quiere
-            # en tiempo real.
-            f"queue leaky=downstream max-size-buffers=3 ! "
+            # Sin queue a proposito: un buffer intermedio suma latencia (hasta
+            # 3 frames de retraso) y lo que falta aqui es velocidad, no caudal.
+            # El pipeline lineal rinde los 30 fps del stream de sobra (medido).
             # El output virtual de Plasma 6.7 sale a 1920x1080 fijo: el
             # videoscale es lo que hace que la tablet reciba exactamente el
-            # tamano configurado en config.ini. method=0 es bilineal rapido.
+            # tamano configurado en config.ini.
             f"videoconvert ! videoscale method=0 ! "
             f"video/x-raw,width={self.width},height={self.height},format=I420 ! "
             f"jpegenc name=enc quality={self.jpeg_quality} ! "
@@ -310,43 +304,31 @@ class VirtualMonitorCapture:
     # -- calidad adaptativa ---------------------------------------------
     def note_ack_latency(self, seconds: float) -> None:
         """Latencia medida por el cliente: tiempo entre mandar un frame y que
-        llegue su FlowControlAck. Es la unica señal que tenemos del ancho de
-        banda real, e incluye la red mas lo que tarda la app."""
-        if not self._adaptive_quality or seconds <= 0:
+        llegue su FlowControlAck. Incluye red y decodificacion en la tablet."""
+        if seconds <= 0:
             return
         self._latency = seconds if self._latency is None else self._latency * 0.8 + seconds * 0.2
 
-        now = time.monotonic()
-        if now - self._last_adjust < 3.0:
-            return
-        self._last_adjust = now
-
-        if self._latency > self._target_latency:
-            self._apply_quality(self.jpeg_quality - 5)
-            if self.jpeg_quality <= self._quality_min and not self._warned_floor:
-                self._warned_floor = True
-                log.warning(
-                    "Latencia alta (%.0f ms) con la calidad JPEG en el minimo (%d). "
-                    "Bajar capture.width/height es lo que mas va a ayudar.",
-                    self._latency * 1000, self.jpeg_quality,
-                )
-        elif self._latency < self._target_latency * 0.6:
-            self._apply_quality(self.jpeg_quality + 5)
-
-    def _apply_quality(self, quality: int) -> None:
+    def set_jpeg_quality(self, quality: int) -> bool:
         low = max(1, self._quality_min)
         high = min(100, self._quality_max)
         quality = max(low, min(high, quality))
         if quality == self.jpeg_quality:
-            return
+            return False
         self.jpeg_quality = quality
         if self._encoder is not None:
             self._encoder.set_property("quality", quality)
-        log.info("Calidad JPEG -> %d (latencia %.0f ms)", quality, (self._latency or 0) * 1000)
+        return True
 
     @property
     def latency(self) -> float | None:
         return self._latency
+
+    @property
+    def samples(self) -> int:
+        """Frames que produjo el pipeline. Si esto no llega al objetivo, el
+        problema no es la red sino que el escritorio no esta generando imagen."""
+        return self._samples
 
     def _warn_if_no_frames(self) -> bool:
         with self._last_frame_lock:
@@ -383,6 +365,7 @@ class VirtualMonitorCapture:
     # -- frames ---------------------------------------------------------
     def _on_sample(self, appsink):
         sample = appsink.emit("pull-sample")
+        self._samples += 1
         if not self._logged_caps:
             self._logged_caps = True
             log.info("Caps reales del primer frame capturado: %s", sample.get_caps().to_string())

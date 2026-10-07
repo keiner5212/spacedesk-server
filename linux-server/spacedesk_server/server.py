@@ -99,6 +99,21 @@ async def detect_transport(reader, writer) -> Connection:
     return Connection(PeekedReader(reader, peek), writer, False)
 
 
+def _adjust_quality(capture, fps: float, target_fps: int) -> None:
+    """El protocolo obliga a esperar el ACK antes del siguiente frame, asi que
+    fps ~= 1/latencia: cada byte de mas se paga en tiempo de ida y vuelta. Por
+    eso el control apunta a FPS, no a latencia. Bajar 8 puntos si estamos lejos
+    del objetivo (recupera fps rapido), subir 3 si sobra margen (nitidez)."""
+    if fps < target_fps * 0.8:
+        delta = -8
+    elif fps > target_fps * 1.15:
+        delta = 3
+    else:
+        return
+    if capture.set_jpeg_quality(capture.jpeg_quality + delta):
+        log.info("Calidad JPEG -> %d (%.1f fps, objetivo %d)", capture.jpeg_quality, fps, target_fps)
+
+
 class CaptureUnavailable(Exception):
     """La captura no se pudo crear. El fallo se recuerda: sin esto cada cliente
     que reconecta reintentaria el portal y volcaria un traceback, y la tablet
@@ -116,7 +131,11 @@ class SharedCapture:
         self._lock = asyncio.Lock()
         self._failure: str | None = None
 
-    async def get_or_create(self) -> VirtualMonitorCapture:
+    @property
+    def settings(self) -> Settings:
+        return self._settings
+
+    async def get_or_create(self, client_quality: int = 0) -> VirtualMonitorCapture:
         async with self._lock:
             if self._failure is not None:
                 raise CaptureUnavailable(self._failure)
@@ -130,8 +149,9 @@ class SharedCapture:
                     persist_permissions=settings.persist_permissions,
                     adaptive_quality=settings.adaptive_quality,
                     jpeg_quality_min=settings.jpeg_quality_min,
-                    jpeg_quality_max=settings.jpeg_quality_max,
-                    target_latency=settings.target_latency_ms / 1000,
+                    # La tablet dice en su Identification la calidad que
+                    # quiere; no tiene sentido mandarle mas.
+                    jpeg_quality_max=min(settings.jpeg_quality_max, client_quality or 100),
                 )
                 loop = asyncio.get_event_loop()
                 try:
@@ -201,7 +221,7 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
     # SurfaceView real de la app es SIEMPRE 1920x1200 (confirmado con logcat:
     # "addSurfaceChangedCallback ... 0,0-1920,1200"), sin importar lo que el
     # cliente reporte en su Identification.
-    capture = await shared_capture.get_or_create()
+    capture = await shared_capture.get_or_create(ident.quality)
 
     # Sin esto la app se queda mostrando "Display off" indefinidamente aunque
     # ya le estemos mandando FrameBuffer -- ver protocol.py build_visibility_header.
@@ -212,29 +232,37 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
         capture.stream_width, capture.stream_height,
         ident.effective_width(), ident.effective_height(),
     )
+    # Ventana de control de flujo. Con 1 (lo que manda el protocolo) cada frame
+    # espera su ACK, asi que el techo de fps es 1/latencia: con los ~45 ms de
+    # piso que impone la tablet eso da ~22 fps. Con 2 se mandan dos frames sin
+    # esperar el primero, lo que duplica el techo. Es opt-in porque si la app
+    # no tolera mas de un frame sin confirmar se rompe la imagen.
+    max_inflight = max(1, shared_capture.settings.in_flight_frames)
     ack_event = asyncio.Event()
     ack_event.set()  # listo para mandar el primer frame sin esperar ACK previo
     stop_event = asyncio.Event()
     seen_types: collections.Counter = collections.Counter()
-    sent_at: float | None = None
+    unacked = 0
+    inflight_at: collections.deque = collections.deque()
     frames_sent = 0
     bytes_sent = 0
+    samples_at_window = capture.samples
     window_start = time.monotonic()
 
     async def sender() -> None:
-        nonlocal sent_at, frames_sent, bytes_sent, window_start
+        nonlocal unacked, frames_sent, bytes_sent, window_start, samples_at_window
         loop = asyncio.get_event_loop()
         while not stop_event.is_set():
-            try:
-                await asyncio.wait_for(ack_event.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                continue
+            if unacked >= max_inflight:
+                try:
+                    await asyncio.wait_for(ack_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
             ack_event.clear()
-            # timeout corto para el keep-alive: si la pantalla esta estatica y
-            # repetimos el ultimo frame, queremos hacerlo a un ritmo razonable
-            # (~5fps) para que el cliente no interprete la espera como ancho de
-            # banda bajo.
-            jpeg = await loop.run_in_executor(None, capture.get_frame, 0.2)
+            # timeout corto para el keep-alive: si la pantalla esta estatica
+            # repetimos el ultimo frame para que la app no interprete la
+            # espera como ancho de banda bajo.
+            jpeg = await loop.run_in_executor(None, capture.get_frame, 0.03)
             if jpeg is None:
                 ack_event.set()
                 continue
@@ -254,7 +282,8 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 fragment_info=0,
             )
             try:
-                sent_at = time.monotonic()
+                inflight_at.append(time.monotonic())
+                unacked += 1
                 await conn.write_packet(fb_header, jpeg)
                 frames_sent += 1
                 bytes_sent += len(jpeg)
@@ -263,20 +292,27 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 break
             now = time.monotonic()
             if now - window_start >= 5.0:
+                elapsed = now - window_start
+                fps = frames_sent / elapsed
                 latency = capture.latency
                 log.info(
-                    "Stats: %.1f fps, %.0f KB/frame, latencia ACK %s, jpeg=%d, %dx%d",
-                    frames_sent / (now - window_start),
-                    bytes_sent / frames_sent / 1024,
+                    "Stats: enviados %.1f fps (%.0f KB/frame), capturado %.1f fps, "
+                    "latencia ACK %s, jpeg=%d, %dx%d",
+                    fps,
+                    bytes_sent / frames_sent / 1024 if frames_sent else 0,
+                    (capture.samples - samples_at_window) / elapsed,
                     f"{latency * 1000:.0f} ms" if latency else "n/d",
                     capture.jpeg_quality, capture.width, capture.height,
                 )
+                if shared_capture.settings.adaptive_quality and frames_sent:
+                    _adjust_quality(capture, fps, shared_capture.settings.target_fps)
                 frames_sent = 0
                 bytes_sent = 0
+                samples_at_window = capture.samples
                 window_start = now
 
     async def receiver() -> None:
-        nonlocal sent_at
+        nonlocal unacked
         loop = asyncio.get_event_loop()
         while not stop_event.is_set():
             result = await conn.read_packet()
@@ -286,13 +322,19 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
             header, _payload = result
             htype = proto.header_type(header)
             seen_types[htype] += 1
-            log.debug("<- %s payload=%dB header=%s",
-                      proto.header_name(htype), proto.payload_length(header), header.hex())
+            # El volcado hex es solo para los paquetes de entrada: el
+            # FlowControlAck llega decenas de veces por segundo y construir un
+            # hex de 128 bytes en cada uno no aporta nada.
+            if htype != proto.HeaderType.FLOW_CONTROL_ACK:
+                log.debug("<- %s payload=%dB header=%s",
+                          proto.header_name(htype), proto.payload_length(header), header.hex())
             if htype == proto.HeaderType.FLOW_CONTROL_ACK:
+                unacked = max(0, unacked - 1)
                 ack_event.set()
-                if sent_at is not None:
-                    capture.note_ack_latency(time.monotonic() - sent_at)
-                    sent_at = None
+                # La latencia se mide con el frame mas viejo sin confirmar,
+                # que es el que realmente esta frenando la linea.
+                if inflight_at:
+                    capture.note_ack_latency(time.monotonic() - inflight_at.popleft())
             elif htype == proto.HeaderType.TOUCH:
                 # vinput.* hace una llamada D-Bus sincrona (call_sync) -- sin
                 # el executor, cada touch/mouse/key bloquearia el loop entero
@@ -319,8 +361,18 @@ async def handle_connection(conn, addr, shared_capture: SharedCapture) -> None:
                 log.warning("Paquete %s sin manejar de %s: header=%s",
                             proto.header_name(htype), addr, header.hex())
 
+    async def receiver_guarded() -> None:
+        # Si el despacho de un paquete revienta, la tarea moria en silencio y la
+        # sesion quedaba colgada para siempre esperando un ACK que ya no iba a
+        # llegar. Ahora se loguea y se cierra la conexion.
+        try:
+            await receiver()
+        except Exception:
+            log.exception("Error leyendo paquetes de %s, se cierra la conexion", addr)
+            stop_event.set()
+
     sender_task = asyncio.create_task(sender())
-    receiver_task = asyncio.create_task(receiver())
+    receiver_task = asyncio.create_task(receiver_guarded())
     await stop_event.wait()
     sender_task.cancel()
     receiver_task.cancel()
